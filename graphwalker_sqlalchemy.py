@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 
+from sqlalchemy import orm as sa_orm
 from sqlalchemy.exc import NoInspectionAvailable
 from sqlalchemy.inspection import inspect as sa_inspect
 from sqlalchemy.ext.declarative import clsregistry
@@ -33,6 +34,25 @@ def get_class_name(cls_orm_model):
         return str(cls_orm_model)
 
 
+def _iter_relationship_properties(cls_orm_model):
+    try:
+        mapper = sa_inspect(cls_orm_model)
+    except NoInspectionAvailable:
+        mapper = None
+    if mapper:
+        for relation_name in mapper.relationships.keys():
+            yield relation_name, mapper.relationships[relation_name]
+
+
+def _get_relation_target(relation):
+    target = relation.argument
+    if isinstance(target, clsregistry._class_resolver):
+        target = target()
+    if isinstance(target, sa_orm.Mapper):
+        target = target.class_
+
+    return target
+
 def _r_extract_vertices(cls_orm_model, vertex_map: dict, fq_vertex_labels=False):
     qualified_model_name = get_vertex_key(cls_orm_model)
     vertex_id = _make_hash_id(qualified_model_name)
@@ -47,7 +67,11 @@ def _r_extract_vertices(cls_orm_model, vertex_map: dict, fq_vertex_labels=False)
         vertex_name = get_class_name(cls_orm_model)
 
     # extract the current vertex
-    base_class_names = [get_class_name(b) for b in inspect.getmro(cls_orm_model)]
+    is_class = inspect.isclass(cls_orm_model)
+    if is_class:
+        base_class_names = [get_class_name(b) for b in inspect.getmro(cls_orm_model)]
+    else:
+        base_class_names = []
     vertex_map[vertex_id] = {
         'id': vertex_id,
         'label': vertex_name,
@@ -62,8 +86,11 @@ def _r_extract_vertices(cls_orm_model, vertex_map: dict, fq_vertex_labels=False)
     }
 
     # recurse
-    for child_class in cls_orm_model.__subclasses__():
-        _r_extract_vertices(child_class, vertex_map)
+    for _, child_class in _iter_relationship_properties(cls_orm_model):
+        _r_extract_vertices(_get_relation_target(child_class), vertex_map, fq_vertex_labels=fq_vertex_labels)
+    if is_class:
+        for child_class in cls_orm_model.__subclasses__():
+            _r_extract_vertices(child_class, vertex_map, fq_vertex_labels=fq_vertex_labels)
 
 
 def _r_extract_edges(cls_orm_model, visited: set, edge_map: dict):
@@ -76,62 +103,53 @@ def _r_extract_edges(cls_orm_model, visited: set, edge_map: dict):
 
     source_vertex_id = _make_hash_id(source_qualified_model_name)
 
-    try:
-        mapper = sa_inspect(cls_orm_model)
-    except NoInspectionAvailable:
-        mapper = None
-    if mapper:
-        for relation_name in mapper.relationships.keys():
-            relation = mapper.relationships[relation_name]
+    for relation_name, relation in _iter_relationship_properties(cls_orm_model):
+        target = _get_relation_target(relation)
 
-            target = relation.argument
-            if isinstance(target, clsregistry._class_resolver):
-                target = target()
+        dest_qualified_model_name = get_vertex_key(target)
+        dest_vertex_id = _make_hash_id(dest_qualified_model_name)
 
-            dest_qualified_model_name = get_vertex_key(target)
-            dest_vertex_id = _make_hash_id(dest_qualified_model_name)
+        back_reference = relation.backref
+        if type(back_reference) == tuple:
+            back_reference = back_reference[0]
 
-            back_reference = relation.backref
-            if type(back_reference) == tuple:
-                back_reference = back_reference[0]
+        relation_type = relation.direction.name
 
-            relation_type = relation.direction.name
+        edge_qname = '{}({},{})'.format(
+            relation_type,
+            source_qualified_model_name,
+            dest_qualified_model_name
+        )
+        edge_id = _make_hash_id(edge_qname)
 
-            edge_qname = '{}({},{})'.format(
-                relation_type,
-                source_qualified_model_name,
-                dest_qualified_model_name
-            )
-            edge_id = _make_hash_id(edge_qname)
+        field_properties = {
+            'name': relation_name,
+            'back_reference': back_reference,
+            'source_columns': [c.name for c in relation.local_columns],
+            'dest_columns': [c.name for c in relation.remote_side]
+        }
 
-            field_properties = {
-                'name': relation_name,
-                'back_reference': back_reference,
-                'source_columns': [c.name for c in relation.local_columns],
-                'dest_columns': [c.name for c in relation.remote_side]
-            }
-
-            existing_edge = edge_map.get(edge_id)
-            if not existing_edge:
-                edge = {
-                    'id': edge_id,
-                    'label': None,
-                    'source': source_vertex_id,
-                    'dest': dest_vertex_id,
-                    'properties': {
-                        'type': relation_type,
-                        'is_self_referential': relation._is_self_referential,
-                        'fields': {
-                            relation_name: field_properties
-                        },
-                        'multiplicity': _RELATION_TYPE_MAP[relation_type]
-                    }
+        existing_edge = edge_map.get(edge_id)
+        if not existing_edge:
+            edge = {
+                'id': edge_id,
+                'label': None,
+                'source': source_vertex_id,
+                'dest': dest_vertex_id,
+                'properties': {
+                    'type': relation_type,
+                    'is_self_referential': relation._is_self_referential,
+                    'fields': {
+                        relation_name: field_properties
+                    },
+                    'multiplicity': _RELATION_TYPE_MAP[relation_type]
                 }
-                edge_map[edge_id] = edge
-            else:
-                existing_edge['properties']['fields'][relation_name] = field_properties
+            }
+            edge_map[edge_id] = edge
+        else:
+            existing_edge['properties']['fields'][relation_name] = field_properties
 
-    # add edges for inheritance
+    # inspect subclasses
     relation_type = 'inheritance'
     for child_class in cls_orm_model.__subclasses__():
         dest_qualified_model_name = get_vertex_key(child_class)
